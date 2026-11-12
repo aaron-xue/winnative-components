@@ -1,11 +1,10 @@
 name: Build FEXCore Stable
 
 # Builds both FEXCore packages from the latest FEX-Emu/FEX release and publishes
-# them to the long-lived stable releases consumed by Contents-json.yml:
-#   Stable-FEX       -> FEXCore-<version>.wcp       (wine DLLs only)
-#   Stable-fex-unix  -> FEXCore-<version>-unix.wcp  (DLLs + aarch64-unix .so)
-# Existing assets on those releases are preserved; rebuilding the same version
-# replaces only its own asset.
+# them together in one versioned release (tag FEXCore-<version>):
+#   FEXCore-<version>.wcp       (wine DLLs only)
+#   FEXCore-<version>-unix.wcp  (DLLs + aarch64-unix .so)
+# Re-running the same version replaces only that release's own assets.
 on:
   workflow_dispatch:
     inputs:
@@ -24,6 +23,7 @@ jobs:
     outputs:
       fex_ref: ${{ steps.resolve.outputs.fex_ref }}
       version: ${{ steps.resolve.outputs.version }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
     steps:
       - name: Get latest FEX release
         id: resolve
@@ -41,9 +41,27 @@ jobs:
             exit 1
           fi
           VERSION="${FEX_REF#FEX-}"
+          RELEASE_TAG="FEXCore-${VERSION}"
           echo "fex_ref=$FEX_REF" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Building FEX release **$FEX_REF** (version $VERSION)" >> "$GITHUB_STEP_SUMMARY"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Building FEX release **$FEX_REF** (version $VERSION) into **$RELEASE_TAG**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ensure version release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+          VERSION_NAME: ${{ steps.resolve.outputs.version }}
+          FEX_REF: ${{ steps.resolve.outputs.fex_ref }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists"
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "FEXCore $VERSION_NAME" \
+              --notes "FEXCore $VERSION_NAME built from FEX $FEX_REF (https://github.com/FEX-Emu/FEX/releases/tag/$FEX_REF). Assets: FEXCore-$VERSION_NAME.wcp (wine DLLs) and FEXCore-$VERSION_NAME-unix.wcp (DLLs + aarch64-unix .so)."
+          fi
 
   build-fexcore:
     name: Build FEXCore (DLLs)
@@ -52,7 +70,7 @@ jobs:
     env:
       VERSION_NAME: ${{ needs.resolve-release.outputs.version }}
       FEX_REF: ${{ needs.resolve-release.outputs.fex_ref }}
-      STABLE_TAG: Stable-FEX
+      RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
@@ -214,18 +232,14 @@ jobs:
           path: '*.wcp'
           compression-level: 0
 
-      - name: Publish to Stable-FEX
+      - name: Publish to version release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           ASSET="FEXCore-${VERSION_NAME}.wcp"
-          if ! gh release view "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "$STABLE_TAG" --notes "Stable FEXCore builds"
-          fi
-          gh release upload "$STABLE_TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
-          echo "Published $ASSET (FEX $FEX_REF @ $COMMIT_HASH) to $STABLE_TAG" >> "$GITHUB_STEP_SUMMARY"
+          gh release upload "$RELEASE_TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Published $ASSET (FEX $FEX_REF @ $COMMIT_HASH) to $RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
 
   build-fexcore-unix:
     name: Build FEXCore-Unix (DLLs + bionic .so)
@@ -234,7 +248,7 @@ jobs:
     env:
       VERSION_NAME: ${{ needs.resolve-release.outputs.version }}
       FEX_REF: ${{ needs.resolve-release.outputs.fex_ref }}
-      STABLE_TAG: Stable-fex-unix
+      RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
@@ -481,15 +495,11 @@ jobs:
           path: '*.wcp'
           compression-level: 0
 
-      - name: Publish to Stable-fex-unix
+      - name: Publish to version release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           ASSET="FEXCore-${VERSION_NAME}-unix.wcp"
-          if ! gh release view "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "$STABLE_TAG" --notes "Stable FEXCore-Unix builds"
-          fi
-          gh release upload "$STABLE_TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
-          echo "Published $ASSET to $STABLE_TAG (FEX $FEX_REF, https://github.com/FEX-Emu/FEX/commit/$FEX_SHA)" >> "$GITHUB_STEP_SUMMARY"
+          gh release upload "$RELEASE_TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Published $ASSET to $RELEASE_TAG (FEX $FEX_REF, https://github.com/FEX-Emu/FEX/commit/$FEX_SHA)" >> "$GITHUB_STEP_SUMMARY"

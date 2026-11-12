@@ -65,8 +65,7 @@ For Driver manager URL. Paste main repo URL.
 | **DXVK** (ARM64EC) | [**Browse Stable Versions**](https://github.com/nicholasx417/WinNative-Components/releases/tag/Stable-Arm64ec-Dxvk) |
 | **VKD3D-Proton** (Standard) | [**Browse Stable Versions**](https://github.com/nicholasx417/WinNative-Components/releases/tag/Stable-VKD3D) |
 | **VKD3D-Proton** (ARM64EC) | [**Browse Stable Versions**](https://github.com/nicholasx417/WinNative-Components/releases/tag/Stable-arm64ec-VKD3D) |
-| **FEXCore** (ARM64EC) | [**Browse Stable Versions**](https://github.com/nicholasx417/WinNative-Components/releases/tag/Stable-FEX) |
-| **FEXCore-Unix** (ARM64EC) | [**Browse Stable Versions**](https://github.com/nicholasx417/WinNative-Components/releases/tag/Stable-fex-unix) |
+| **FEXCore** (DLLs + Unix) | [**Browse Stable Versions**](../../releases?q=FEXCore-&expanded=true) |
 | **Box64** (Standard) | [**Browse Stable Versions**](https://github.com/nicholasx417/WinNative-Components/releases/tag/Stable-Box64) |
 | **WOWBox64** | [**Browse Stable Versions**](https://github.com/nicholasx417/WinNative-Components/releases/tag/Stable-wowbox64) |
 | **DXVK Sarek** | [**Browse Stable Versions**](https://github.com/nicholasx417/WinNative-Components/releases/tag/Sarek) |
