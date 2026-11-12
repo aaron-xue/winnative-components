@@ -1,0 +1,134 @@
+name: Update Contents JSON
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate-hub:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Generate contents.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python -c '
+          import os
+          import json
+          import subprocess
+          import re
+
+          pack_data = []
+          repo = os.environ.get("GITHUB_REPOSITORY")
+
+          nightly_targets = [
+              ("DXVK", "dxvk-nightly-"),
+              ("DXVK", "dxvk-arm64ec-nightly-"),
+              ("DXVK", "dxvk-sarek-nightly-"),
+              ("DXVK", "dxvk-sarek-arm64ec-nightly-"),
+              ("DXVK", "dxvk-pre-regress-nightly-"),
+              ("DXVK", "dxvk-arm64ec-pre-regress-nightly-"),
+              ("D7VK", "d7vk-nightly-"),
+              ("D7VK", "d7vk-arm64ec-nightly-"),
+              ("VKD3D", "vkd3d-nightly-"),
+              ("VKD3D", "vkd3d-arm64ec-nightly-"),
+              ("FEXCore", "fex-nightly-"),
+              ("FEXCore", "fex-unix-"),
+              ("Box64", "box64-nightly-"),
+              ("Box64", "bionic-box64-nightly-"),
+              ("WOWBox64", "wowbox64-nightly-"),
+          ]
+
+          stable_targets = [
+              ("DXVK", "Stable-Dxvk"),
+              ("DXVK", "Stable-Arm64ec-Dxvk"),
+              ("D7VK", "D7VK"),
+              ("D7VK", "D7-arm"),
+              ("VKD3D", "Stable-VKD3D"),
+              ("VKD3D", "Stable-arm64ec-VKD3D"),
+              ("FEXCore", "Stable-FEX"),
+              ("FEXCore", "Stable-fex-unix"),
+              ("Box64", "Stable-Box64"),
+              ("WOWBox64", "Stable-wowbox64"),
+              ("Wine", "Wine"),
+              ("Proton", "Proton"),
+              ("Proton", "Proton-unix"),
+          ]
+
+          def run_gh(cmd):
+              result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+              return result.stdout.strip()
+
+          tags_json = run_gh(f"gh release list --repo {repo} --limit 100 --json tagName")
+          all_tags = []
+          if tags_json:
+              try:
+                  all_tags = [t.get("tagName") for t in json.loads(tags_json)]
+              except:
+                  pass
+
+          for w_type, prefix in nightly_targets:
+              tag = next((t for t in all_tags if t.startswith(prefix)), None)
+              if tag:
+                  assets_json = run_gh(f"gh release view {tag} --repo {repo} --json assets")
+                  if assets_json:
+                      try:
+                          assets = json.loads(assets_json).get("assets", [])
+                          for asset in assets:
+                              asset_name = asset.get("name", "")
+                              if asset_name.endswith(".wcp") or asset_name.endswith(".wcp.xz"):
+                                  clean_name = asset_name.replace(".wcp.xz", "").replace(".wcp", "")
+                                  if w_type == "VKD3D":
+                                      clean_name = clean_name.replace("-proton", "").replace("-Proton", "")
+                                  pack_data.append({
+                                      "type": w_type,
+                                      "verName": clean_name,
+                                      "verCode": "0",
+                                      "remoteUrl": f"https://github.com/{repo}/releases/download/{tag}/{asset_name}"
+                                  })
+                      except:
+                          pass
+
+          for w_type, tag in stable_targets:
+              assets_json = run_gh(f"gh release view {tag} --repo {repo} --json assets")
+              if assets_json:
+                  try:
+                      assets = json.loads(assets_json).get("assets", [])
+                      for asset in assets:
+                          asset_name = asset.get("name", "")
+                          if asset_name.endswith(".wcp") or asset_name.endswith(".wcp.xz"):
+                              clean_name = asset_name.replace(".wcp.xz", "").replace(".wcp", "")
+                              if w_type == "VKD3D":
+                                  clean_name = clean_name.replace("-proton", "").replace("-Proton", "")
+                              pack_data.append({
+                                  "type": w_type,
+                                  "verName": clean_name,
+                                  "verCode": "0",
+                                  "remoteUrl": f"https://github.com/{repo}/releases/download/{tag}/{asset_name}"
+                              })
+                  except:
+                      pass
+
+          def version_sort_key(item):
+              numbers = [int(n) for n in re.findall(r"\d+", item["verName"])]
+              descending_numbers = [-n for n in numbers]
+              return (item["type"], descending_numbers, item["verName"])
+
+          pack_data = sorted(pack_data, key=version_sort_key)
+
+          with open("contents.json", "w") as f:
+              json.dump(pack_data, f, indent=2)
+          '
+
+      - name: Commit and Push contents.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add contents.json
+          git commit -m "Auto-update WCP Hub contents.json [skip ci]" || echo "No changes to commit"
+          git push

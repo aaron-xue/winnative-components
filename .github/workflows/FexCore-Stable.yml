@@ -1,0 +1,495 @@
+name: Build FEXCore Stable
+
+# Builds both FEXCore packages from the latest FEX-Emu/FEX release and publishes
+# them to the long-lived stable releases consumed by Contents-json.yml:
+#   Stable-FEX       -> FEXCore-<version>.wcp       (wine DLLs only)
+#   Stable-fex-unix  -> FEXCore-<version>-unix.wcp  (DLLs + aarch64-unix .so)
+# Existing assets on those releases are preserved; rebuilding the same version
+# replaces only its own asset.
+on:
+  workflow_dispatch:
+    inputs:
+      fex_ref:
+        description: "FEX release tag to build (e.g. FEX-2608). Leave empty to use the latest release."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-release:
+    name: Resolve FEX release
+    runs-on: ubuntu-latest
+    outputs:
+      fex_ref: ${{ steps.resolve.outputs.fex_ref }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Get latest FEX release
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FEX_REF_INPUT: ${{ github.event.inputs.fex_ref }}
+        run: |
+          set -euo pipefail
+          FEX_REF="$FEX_REF_INPUT"
+          if [ -z "$FEX_REF" ]; then
+            FEX_REF=$(gh api repos/FEX-Emu/FEX/releases/latest --jq '.tag_name')
+          fi
+          if [ -z "$FEX_REF" ]; then
+            echo "::error::Could not resolve a FEX release tag"
+            exit 1
+          fi
+          VERSION="${FEX_REF#FEX-}"
+          echo "fex_ref=$FEX_REF" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building FEX release **$FEX_REF** (version $VERSION)" >> "$GITHUB_STEP_SUMMARY"
+
+  build-fexcore:
+    name: Build FEXCore (DLLs)
+    needs: resolve-release
+    runs-on: ubuntu-latest
+    env:
+      VERSION_NAME: ${{ needs.resolve-release.outputs.version }}
+      FEX_REF: ${{ needs.resolve-release.outputs.fex_ref }}
+      STABLE_TAG: Stable-FEX
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: my-repo
+
+      - name: Checkout FEX (release)
+        uses: actions/checkout@v4
+        with:
+          repository: FEX-Emu/FEX
+          ref: ${{ needs.resolve-release.outputs.fex_ref }}
+          submodules: recursive
+          fetch-depth: 0
+          path: src
+
+      - name: Apply FEX app-config fix
+        run: |
+          cd src
+          patch -p1 < ../my-repo/patch/fex-appconfig-nonfatal.patch
+          grep -q 'invalid JSON format, ignoring it' Source/Common/Config.cpp
+
+      - name: Get commit info
+        run: |
+          git config --global --add safe.directory '*'
+          cd src
+          echo "COMMIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl xz-utils jq git glslang-tools \
+            build-essential python3 python3-venv python3-pip \
+            pkg-config cmake ninja-build zstd dos2unix perl tar unzip \
+            llvm crossbuild-essential-arm64 ccache
+
+      - name: Cache llvm-mingw
+        id: cache-llvm-mingw
+        uses: actions/cache@v4
+        with:
+          path: /opt/llvm-mingw
+          key: llvm-mingw-20251104
+
+      - name: Setup Toolchain
+        if: steps.cache-llvm-mingw.outputs.cache-hit != 'true'
+        run: |
+          LLVM_MINGW_TAG="20251104"
+          TOOLCHAIN_DIR="/opt/llvm-mingw"
+          wget -q "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_TAG/llvm-mingw-$LLVM_MINGW_TAG-ucrt-ubuntu-22.04-x86_64.tar.xz" -O llvm.tar.xz
+          sudo rm -rf "$TOOLCHAIN_DIR"
+          sudo mkdir -p "$TOOLCHAIN_DIR"
+          sudo tar -C "$TOOLCHAIN_DIR" --strip-components=1 -xJf llvm.tar.xz
+          rm llvm.tar.xz
+
+      - name: Set PATH
+        run: echo "/opt/llvm-mingw/bin" >> "$GITHUB_PATH"
+
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-fexcore-stable-${{ needs.resolve-release.outputs.fex_ref }}
+          restore-keys: |
+            ccache-fexcore-stable-
+
+      - name: Configure ccache
+        run: |
+          mkdir -p .ccache
+          echo "CCACHE_DIR=$PWD/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_COMPRESS=1" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
+
+      - name: Build FEXCore
+        run: |
+          build_arch() {
+            local triple="$1"
+            local dest="$2"
+            local build_dir="build-${triple}"
+
+            rm -rf "$build_dir"
+            mkdir "$build_dir"
+            cd "$build_dir"
+
+            cmake -G Ninja -Wno-dev \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_TOOLCHAIN_FILE=../Data/CMake/toolchain_mingw.cmake \
+              -DMINGW_TRIPLE="${triple}-w64-mingw32" \
+              -DCMAKE_INSTALL_PREFIX=/usr \
+              -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-windows \
+              -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+              -DENABLE_LTO=False \
+              -DENABLE_ASSERTIONS=False \
+              -DBUILD_TESTING=False \
+              -DTUNE_CPU=generic \
+              -DTUNE_ARCH=generic \
+              ..
+
+            ninja
+            DESTDIR="$dest" ninja install
+
+            cd ..
+          }
+
+          cd src
+          build_arch "arm64ec" "../../stage-ec"
+          build_arch "aarch64" "../../stage-wo"
+
+      - name: Show ccache stats
+        run: ccache -s
+
+      - name: Package
+        run: |
+          rm -rf final_package
+          mkdir -p final_package/system32
+
+          DLL_EC=$(find stage-ec -type f -name '*.dll' | head -n 1)
+          DLL_WOW=$(find stage-wo -type f -name '*.dll' | head -n 1)
+
+          if [ -f "$DLL_EC" ] && [ -f "$DLL_WOW" ]; then
+            cp "$DLL_EC" final_package/system32/libarm64ecfex.dll
+            cp "$DLL_WOW" final_package/system32/libwow64fex.dll
+            /opt/llvm-mingw/bin/llvm-strip --strip-all final_package/system32/libarm64ecfex.dll
+            /opt/llvm-mingw/bin/llvm-strip --strip-all final_package/system32/libwow64fex.dll
+          else
+            echo "::error::Expected FEX DLLs not produced"
+            exit 1
+          fi
+
+          cat <<EOF > final_package/profile.json
+          {
+            "type": "FEXCore",
+            "versionName": "${VERSION_NAME}",
+            "versionCode": 0,
+            "description": "FEXCore ${VERSION_NAME} (FEX ${FEX_REF})",
+            "files": [
+              {
+                "source": "system32/libarm64ecfex.dll",
+                "target": "\${system32}/libarm64ecfex.dll"
+              },
+              {
+                "source": "system32/libwow64fex.dll",
+                "target": "\${system32}/libwow64fex.dll"
+              }
+            ]
+          }
+          EOF
+
+      - name: Create WCP
+        run: |
+          cd final_package
+          tar -cJf "../FEXCore-${VERSION_NAME}.wcp" .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fexcore-stable
+          path: '*.wcp'
+          compression-level: 0
+
+      - name: Publish to Stable-FEX
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ASSET="FEXCore-${VERSION_NAME}.wcp"
+          if ! gh release view "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$STABLE_TAG" --notes "Stable FEXCore builds"
+          fi
+          gh release upload "$STABLE_TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Published $ASSET (FEX $FEX_REF @ $COMMIT_HASH) to $STABLE_TAG" >> "$GITHUB_STEP_SUMMARY"
+
+  build-fexcore-unix:
+    name: Build FEXCore-Unix (DLLs + bionic .so)
+    needs: resolve-release
+    runs-on: ubuntu-latest
+    env:
+      VERSION_NAME: ${{ needs.resolve-release.outputs.version }}
+      FEX_REF: ${{ needs.resolve-release.outputs.fex_ref }}
+      STABLE_TAG: Stable-fex-unix
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: my-repo
+
+      - name: Checkout FEX (release)
+        uses: actions/checkout@v4
+        with:
+          repository: FEX-Emu/FEX
+          ref: ${{ needs.resolve-release.outputs.fex_ref }}
+          submodules: recursive
+          fetch-depth: 0
+          path: src
+
+      - name: Apply FEX app-config fix
+        run: |
+          cd src
+          patch -p1 < ../my-repo/patch/fex-appconfig-nonfatal.patch
+          grep -q 'invalid JSON format, ignoring it' Source/Common/Config.cpp
+
+      - name: Get commit info
+        run: |
+          git config --global --add safe.directory '*'
+          cd src
+          echo "COMMIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "FEX_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl wget xz-utils jq git zip unzip zstd \
+            dos2unix perl tar build-essential python3 python3-pip pkg-config \
+            cmake ninja-build meson
+
+      - name: Setup GLSLANG
+        run: |
+          set -euo pipefail
+          wget -q https://github.com/KhronosGroup/glslang/releases/download/master-tot/glslang-master-linux-Release.zip
+          unzip -q glslang-master-linux-Release.zip -d glslang
+          echo "$PWD/glslang/bin" >> "$GITHUB_PATH"
+
+      - name: Cache llvm-mingw
+        id: cache-llvm-mingw
+        uses: actions/cache@v4
+        with:
+          path: /opt/llvm-mingw
+          key: llvm-mingw-bylaws-20250920
+
+      - name: Setup toolchain
+        if: steps.cache-llvm-mingw.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # bylaws/llvm-mingw 20250920 - the toolchain the FEX-Emu PPA builds with.
+          LLVM_MINGW_TAG="20250920"
+          TOOLCHAIN_DIR="/opt/llvm-mingw"
+          wget -q "https://github.com/bylaws/llvm-mingw/releases/download/$LLVM_MINGW_TAG/llvm-mingw-$LLVM_MINGW_TAG-ucrt-ubuntu-22.04-x86_64.tar.xz" -O llvm.tar.xz
+          sudo rm -rf "$TOOLCHAIN_DIR"
+          sudo mkdir -p "$TOOLCHAIN_DIR"
+          sudo tar -C "$TOOLCHAIN_DIR" --strip-components=1 -xJf llvm.tar.xz
+          rm llvm.tar.xz
+
+      - name: Set PATH
+        run: echo "/opt/llvm-mingw/bin" >> "$GITHUB_PATH"
+
+      - name: Build wine DLLs (arm64ec + wow64)
+        run: |
+          set -euo pipefail
+
+          # FEX PPA DLL recipe: Release + DWARF debug info, CXXFLAGS kept as a
+          # single flag so FEX's -print-libgcc-file-name probe does not break,
+          # INSTALL_LIBDIR=/, DLLs copied straight out of Bin/.
+          build_arch() {
+            local triple="$1"
+            local dest="$2"
+            local build_dir
+            case "$triple" in
+              arm64ec) build_dir="build_arm64ec" ;;
+              aarch64) build_dir="build_wow64" ;;
+            esac
+
+            cd "$GITHUB_WORKSPACE/src"
+            rm -rf "$build_dir" && mkdir "$build_dir" && cd "$build_dir"
+
+            CXXFLAGS="-Wno-deprecated-enum-enum-conversion" \
+            cmake -G Ninja -Wno-dev \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -g -fno-strict-aliasing -fwrapv" \
+              -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -fno-strict-aliasing -fwrapv" \
+              -DCMAKE_TOOLCHAIN_FILE=../Data/CMake/toolchain_mingw.cmake \
+              -DMINGW_TRIPLE="${triple}-w64-mingw32" \
+              -DCMAKE_INSTALL_PREFIX=/usr \
+              -DCMAKE_INSTALL_LIBDIR=/ \
+              -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+              -DENABLE_LTO=False -DENABLE_ASSERTIONS=False -DBUILD_TESTING=False \
+              -DTUNE_ARCH=generic -DTUNE_CPU=generic \
+              -DOVERRIDE_VERSION="${VERSION_NAME}" \
+              ..
+            ninja -j 2
+
+            mkdir -p "$dest"
+            case "$triple" in
+              arm64ec) cp Bin/libarm64ecfex.dll "$dest/libarm64ecfex.dll" ;;
+              aarch64) cp Bin/libwow64fex.dll   "$dest/libwow64fex.dll" ;;
+            esac
+            cd "$GITHUB_WORKSPACE"
+          }
+
+          build_arch "arm64ec" "$GITHUB_WORKSPACE/stage-ec"
+          build_arch "aarch64" "$GITHUB_WORKSPACE/stage-wo"
+
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: /opt/android-ndk
+          key: android-ndk-r27c
+
+      - name: Setup Android NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          NDK_VER="r27c"
+          wget -q "https://dl.google.com/android/repository/android-ndk-${NDK_VER}-linux.zip" -O ndk.zip
+          rm -rf /tmp/ndk-x; mkdir -p /tmp/ndk-x
+          unzip -q ndk.zip -d /tmp/ndk-x
+          sudo rm -rf /opt/android-ndk
+          sudo mv "/tmp/ndk-x/android-ndk-${NDK_VER}" /opt/android-ndk
+          rm -rf ndk.zip /tmp/ndk-x
+
+      - name: Build unix libs (aarch64 bionic .so)
+        run: |
+          set -euo pipefail
+
+          # Built for BIONIC (Android NDK, arm64 API 28) so they load in
+          # WinNative's bionic wine, not glibc.
+          if [ ! -f src/Source/Windows/UnixLib/FEXUnixLib.cpp ]; then
+            echo "::error::This FEX release has no UnixLib; cannot build FEXCore-unix"
+            exit 1
+          fi
+
+          NDK="/opt/android-ndk"
+          API=28
+          CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${API}-clang++"
+          "$CXX" --version | head -1
+
+          # FEXUnixLib.cpp calls shm_open/shm_unlink, which bionic does not
+          # implement. Stub them locally so RTLD_NOW dlopen() cannot fail on an
+          # undefined symbol; -Wl,-z,defs catches any other missing symbol.
+          cat > /tmp/bionic_shm_decl.h <<'HDR'
+          #pragma once
+          #include <sys/types.h>
+          #include <errno.h>
+          extern "C" {
+          static inline int shm_open(const char*, int, mode_t) { errno = ENOSYS; return -1; }
+          static inline int shm_unlink(const char*)            { errno = ENOSYS; return -1; }
+          }
+          HDR
+
+          mkdir -p unixlibs
+          CXXFLAGS="-shared -fPIC -O2 -std=c++17 -g3 -gdwarf-4 -fno-omit-frame-pointer \
+            -fasynchronous-unwind-tables -funwind-tables -mtune=generic \
+            -include /tmp/bionic_shm_decl.h \
+            -Wl,-z,defs"
+          for name in libwow64fex libarm64ecfex; do
+            "$CXX" $CXXFLAGS -o "unixlibs/${name}.so" src/Source/Windows/UnixLib/FEXUnixLib.cpp
+          done
+
+          file unixlibs/*.so
+
+          NM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          for so in unixlibs/*.so; do
+            UND=$("$NM" -D --undefined-only "$so")
+            case "$UND" in
+              *shm_open*|*shm_unlink*)
+                echo "::error::$so still has undefined shm_open/shm_unlink"
+                echo "$UND"
+                exit 1
+                ;;
+            esac
+          done
+          echo "Verified: no undefined shm_open/shm_unlink in either .so"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+
+          rm -rf final_package
+          mkdir -p final_package/system32 final_package/aarch64-unix
+
+          DLL_EC=$(find stage-ec -type f -name 'libarm64ecfex.dll' | head -n1)
+          DLL_WOW=$(find stage-wo -type f -name 'libwow64fex.dll' | head -n1)
+          SO_EC=$(find unixlibs -type f -name 'libarm64ecfex.so' | head -n1)
+          SO_WOW=$(find unixlibs -type f -name 'libwow64fex.so' | head -n1)
+
+          if [ -z "$DLL_EC" ] || [ -z "$DLL_WOW" ] || [ -z "$SO_EC" ] || [ -z "$SO_WOW" ]; then
+            echo "::error::Expected DLLs or unix .so libs not produced"
+            exit 1
+          fi
+
+          # No strip: the DLLs carry full DWARF debug info, matching the PPA.
+          cp "$DLL_EC"  final_package/system32/libarm64ecfex.dll
+          cp "$DLL_WOW" final_package/system32/libwow64fex.dll
+          cp "$SO_EC"   final_package/aarch64-unix/libarm64ecfex.so
+          cp "$SO_WOW"  final_package/aarch64-unix/libwow64fex.so
+
+          cat > final_package/profile.json <<EOF
+          {
+            "type": "FEXCore",
+            "versionName": "${VERSION_NAME}-unix",
+            "versionCode": 0,
+            "description": "FEXCore ${VERSION_NAME} (FEX ${FEX_REF}) +unix libs",
+            "files": [
+              {
+                "source": "aarch64-unix/libarm64ecfex.so",
+                "target": "\${libdir}/wine/aarch64-unix/libarm64ecfex.so"
+              },
+              {
+                "source": "aarch64-unix/libwow64fex.so",
+                "target": "\${libdir}/wine/aarch64-unix/libwow64fex.so"
+              },
+              {
+                "source": "system32/libarm64ecfex.dll",
+                "target": "\${system32}/libarm64ecfex.dll"
+              },
+              {
+                "source": "system32/libwow64fex.dll",
+                "target": "\${system32}/libwow64fex.dll"
+              }
+            ]
+          }
+          EOF
+
+      - name: Create WCP
+        run: |
+          cd final_package
+          tar -cJf "../FEXCore-${VERSION_NAME}-unix.wcp" .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fexcore-stable-unix
+          path: '*.wcp'
+          compression-level: 0
+
+      - name: Publish to Stable-fex-unix
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ASSET="FEXCore-${VERSION_NAME}-unix.wcp"
+          if ! gh release view "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$STABLE_TAG" --notes "Stable FEXCore-Unix builds"
+          fi
+          gh release upload "$STABLE_TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Published $ASSET to $STABLE_TAG (FEX $FEX_REF, https://github.com/FEX-Emu/FEX/commit/$FEX_SHA)" >> "$GITHUB_STEP_SUMMARY"
